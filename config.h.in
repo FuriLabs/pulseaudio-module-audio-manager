@@ -1,0 +1,20 @@
+#ifndef PAAM_CONFIG_H
+#define PAAM_CONFIG_H
+
+/* Generated from config.h.in by ./configure. */
+#define HAVE_CONFIG_H 1
+#define PACKAGE "pulseaudio-module-audio-manager"
+#define PACKAGE_NAME "pulseaudio-module-audio-manager"
+#define PACKAGE_TARNAME "pulseaudio-module-audio-manager"
+#define PACKAGE_VERSION "1.0.0"
+#define PACKAGE_STRING "pulseaudio-module-audio-manager 1.0.0"
+#define PACKAGE_BUGREPORT "bardia@furilabs.com"
+#define PACKAGE_URL "https://github.com/furilabs/pulseaudio-module-audio-manager"
+#define VERSION "1.0.0"
+#define CANONICAL_HOST "@CANONICAL_HOST@"
+#define PULSE_MODULE_VERSION "@PULSE_MODULE_VERSION@"
+@HAVE_ATOMIC_BUILTINS@
+@HAVE_STD_BOOL@
+@SUPPORT_TLS___THREAD@
+
+#endif

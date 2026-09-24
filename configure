@@ -1,0 +1,66 @@
+#!/bin/sh
+set -eu
+
+CC=${CC:-cc}
+CPPFLAGS=${CPPFLAGS:-}
+CFLAGS=${CFLAGS:-}
+OUT_H=${OUT_H:-config.h}
+TEMPLATE=${TEMPLATE:-config.h.in}
+
+TMPDIR_ROOT=${TMPDIR:-/tmp}
+tmp=$(mktemp -d "$TMPDIR_ROOT/paam-configure.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+
+try_compile() {
+    printf '%b\n' "$1" > "$tmp/conftest.c"
+    "$CC" $CPPFLAGS $CFLAGS "$tmp/conftest.c" -o "$tmp/conftest" >/dev/null 2>&1
+}
+
+host=$($CC -dumpmachine 2>/dev/null || true)
+[ -n "$host" ] || host=$(uname -m 2>/dev/null || echo unknown)
+printf 'checking build host... %s\n' "$host"
+
+pulse_module_version=$(pkg-config --modversion libpulse 2>/dev/null | sed 's/-.*//')
+if [ -z "$pulse_module_version" ]; then
+    printf 'error: unable to determine PulseAudio module version from libpulse.pc\n' >&2
+    exit 1
+fi
+printf 'checking PulseAudio module version... %s\n' "$pulse_module_version"
+
+printf 'checking whether %s knows __sync_bool_compare_and_swap()...\n' "$CC"
+if try_compile 'int main(void) { int a = 4; return __sync_bool_compare_and_swap(&a, 4, 5) ? 0 : 1; }'; then
+    atomic='#define HAVE_ATOMIC_BUILTINS 1'
+    printf '  yes\n'
+else
+    printf '  no\n' >&2
+    printf 'error: compiler atomic builtins are required\n' >&2
+    exit 1
+fi
+
+printf 'checking whether %s knows _Bool...\n' "$CC"
+if try_compile 'int main(void) { _Bool b = 1; return b ? 0 : 1; }'; then
+    std_bool='#define HAVE_STD_BOOL 1'
+    printf '  yes\n'
+else
+    std_bool='/* #undef HAVE_STD_BOOL */'
+    printf '  no\n'
+fi
+
+printf 'checking whether %s knows __thread for TLS...\n' "$CC"
+if try_compile 'static __thread int value = 6; int main(void) { value = 5; return value == 5 ? 0 : 1; }'; then
+    tls='#define SUPPORT_TLS___THREAD 1'
+    printf '  yes\n'
+else
+    tls='/* #undef SUPPORT_TLS___THREAD */'
+    printf '  no\n'
+fi
+
+sed -e "s|@CANONICAL_HOST@|$host|g" \
+    -e "s|@PULSE_MODULE_VERSION@|$pulse_module_version|g" \
+    -e "s|@HAVE_ATOMIC_BUILTINS@|$atomic|g" \
+    -e "s|@HAVE_STD_BOOL@|$std_bool|g" \
+    -e "s|@SUPPORT_TLS___THREAD@|$tls|g" \
+    "$TEMPLATE" > "$OUT_H.tmp"
+mv "$OUT_H.tmp" "$OUT_H"
+
+printf 'configuration written to %s\n' "$OUT_H"
