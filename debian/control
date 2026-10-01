@@ -1,0 +1,20 @@
+Source: pulseaudio-module-audio-manager
+Section: sound
+Priority: optional
+Maintainer: Bardia Moshiri <bardia@furilabs.com>
+Build-Depends: debhelper-compat (= 13),
+               pkg-config,
+               libglib2.0-dev,
+               libpulse-dev,
+               libltdl-dev,
+               pulseaudio-pulsecore-dev,
+               libaudio-manager-dev,
+Standards-Version: 4.7.0
+Vcs-Browser: https://github.com/furilabs/pulseaudio-module-audio-manager
+Vcs-Git: https://github.com/furilabs/pulseaudio-module-audio-manager.git
+
+Package: pulseaudio-module-audio-manager
+Architecture: any
+Depends: ${misc:Depends},
+         libaudio-manager,
+Description: PulseAudio hardware module for audio-manager
