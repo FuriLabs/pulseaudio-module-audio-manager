@@ -867,7 +867,7 @@ sink_set_port_cb(pa_sink *sink, pa_device_port *port)
         }
     }
 
-    pa_log_info("audio-manager output route changed to %s (%s)%s",
+    pa_log_info("audio-manager output route changed to %s (%s)",
                 port->name,
                 output_name);
     return 0;
