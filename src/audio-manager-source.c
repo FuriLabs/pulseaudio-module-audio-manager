@@ -14,6 +14,7 @@
 #include <stdint.h>
 
 #include <pulse/rtclock.h>
+#include <pulse/timeval.h>
 #include <pulse/sample.h>
 #include <pulse/util.h>
 #include <pulse/xmalloc.h>
@@ -29,6 +30,8 @@
 #include <pulsecore/rtpoll.h>
 #include <pulsecore/thread.h>
 #include <pulsecore/thread-mq.h>
+
+#define STREAM_RECOVERY_INTERVAL_USEC (PA_USEC_PER_SEC)
 
 struct userdata {
     pa_core *core;
@@ -149,130 +152,6 @@ thread_read_period(struct userdata *u)
     return 0;
 }
 
-static void
-thread_func(void *userdata)
-{
-    struct userdata *u = userdata;
-
-    pa_assert(u);
-
-    pa_log_debug("audio-manager source thread starting");
-
-    if (u->core->realtime_scheduling)
-        pa_thread_make_realtime(u->core->realtime_priority);
-
-    pa_thread_mq_install(&u->thread_mq);
-
-    for (;;) {
-        int ret;
-
-        if (PA_SOURCE_IS_OPENED(u->source->thread_info.state)) {
-            if (u->stream == NULL || thread_read_period(u) < 0)
-                goto fail;
-
-            pa_rtpoll_set_timer_relative(u->rtpoll, 0);
-        } else
-            pa_rtpoll_set_timer_disabled(u->rtpoll);
-
-        ret = pa_rtpoll_run(u->rtpoll);
-        if (ret < 0)
-            goto fail;
-        if (ret == 0)
-            goto finish;
-    }
-
-fail:
-    pa_asyncmsgq_post(u->thread_mq.outq,
-                      PA_MSGOBJECT(u->core),
-                      PA_CORE_MESSAGE_UNLOAD_MODULE,
-                      u->module,
-                      0,
-                      NULL,
-                      NULL);
-    pa_asyncmsgq_wait_for(u->thread_mq.inq, PA_MESSAGE_SHUTDOWN);
-
-finish:
-    pa_log_debug("audio-manager source thread shutting down");
-}
-
-static int
-suspend_stream(struct userdata *u)
-{
-    int ret;
-
-    pa_assert(u);
-
-    if (u->stream == NULL)
-        return -EIO;
-
-    ret = audio_manager_stream_stop(u->stream);
-    if (ret < 0) {
-        pa_log_error("failed to stop audio-manager capture stream: %d", ret);
-        return ret;
-    }
-
-    pa_log_debug("audio-manager capture stream suspended");
-    return 0;
-}
-
-static int
-resume_stream(struct userdata *u)
-{
-    int ret;
-
-    pa_assert(u);
-
-    if (u->stream == NULL)
-        return -EIO;
-
-    ret = audio_manager_stream_start(u->stream);
-    if (ret < 0) {
-        pa_log_error("failed to start audio-manager capture stream: %d", ret);
-        return ret;
-    }
-
-    pa_rtpoll_set_timer_absolute(u->rtpoll, pa_rtclock_now());
-    pa_log_debug("audio-manager capture stream resumed");
-    return 0;
-}
-
-static int
-source_set_state_in_io_thread_cb(pa_source *source,
-                                 pa_source_state_t new_state,
-                                 pa_suspend_cause_t new_suspend_cause)
-{
-    struct userdata *u;
-
-    pa_assert(source);
-    pa_assert_se(u = source->userdata);
-    (void)new_suspend_cause;
-
-    if (new_state == source->thread_info.state)
-        return 0;
-
-    switch (new_state) {
-    case PA_SOURCE_SUSPENDED:
-        if (PA_SOURCE_IS_OPENED(source->thread_info.state))
-            return suspend_stream(u);
-        break;
-    case PA_SOURCE_IDLE:
-    case PA_SOURCE_RUNNING:
-        if (source->thread_info.state == PA_SOURCE_SUSPENDED)
-            return resume_stream(u);
-        pa_rtpoll_set_timer_absolute(u->rtpoll, pa_rtclock_now());
-        break;
-    case PA_SOURCE_UNLINKED:
-        if (PA_SOURCE_IS_OPENED(source->thread_info.state))
-            suspend_stream(u);
-        break;
-    case PA_SOURCE_INIT:
-    case PA_SOURCE_INVALID_STATE:
-        break;
-    }
-
-    return 0;
-}
-
 static bool
 stream_config_matches_source(const AudioManagerStreamConfig *config,
                              const pa_sample_spec *sample_spec)
@@ -376,6 +255,170 @@ restore_capture_role(struct userdata *u,
 }
 
 static int
+recover_stream(struct userdata *u)
+{
+    int ret;
+
+    pa_assert(u);
+    pa_assert(u->source);
+
+    if (u->stream != NULL) {
+        audio_manager_stream_close(u->stream);
+        u->stream = NULL;
+    }
+
+    ret = restore_capture_role(u, u->capture_role, true);
+    if (ret < 0) {
+        pa_log_warn("failed to recover audio-manager capture stream: %d", ret);
+        return ret;
+    }
+
+    pa_log_info("recovered audio-manager capture stream");
+    return 0;
+}
+
+static void
+thread_func(void *userdata)
+{
+    struct userdata *u = userdata;
+
+    pa_assert(u);
+
+    pa_log_debug("audio-manager source thread starting");
+
+    if (u->core->realtime_scheduling)
+        pa_thread_make_realtime(u->core->realtime_priority);
+
+    pa_thread_mq_install(&u->thread_mq);
+
+    for (;;) {
+        int ret;
+
+        if (PA_SOURCE_IS_OPENED(u->source->thread_info.state)) {
+            if (u->stream == NULL) {
+                if (recover_stream(u) < 0) {
+                    pa_rtpoll_set_timer_relative(u->rtpoll, STREAM_RECOVERY_INTERVAL_USEC);
+                    goto poll;
+                }
+            }
+
+            if (thread_read_period(u) < 0) {
+                pa_log_warn("audio-manager capture stream failed, attempting recovery");
+                if (recover_stream(u) < 0)
+                    pa_rtpoll_set_timer_relative(u->rtpoll, STREAM_RECOVERY_INTERVAL_USEC);
+                else
+                    pa_rtpoll_set_timer_relative(u->rtpoll, 0);
+                goto poll;
+            }
+
+            pa_rtpoll_set_timer_relative(u->rtpoll, 0);
+        } else
+            pa_rtpoll_set_timer_disabled(u->rtpoll);
+
+poll:
+        ret = pa_rtpoll_run(u->rtpoll);
+        if (ret < 0)
+            goto fail;
+        if (ret == 0)
+            goto finish;
+    }
+
+fail:
+    pa_log_error("audio-manager source rtpoll failed, unloading module");
+    pa_asyncmsgq_post(u->thread_mq.outq,
+                      PA_MSGOBJECT(u->core),
+                      PA_CORE_MESSAGE_UNLOAD_MODULE,
+                      u->module,
+                      0,
+                      NULL,
+                      NULL);
+    pa_asyncmsgq_wait_for(u->thread_mq.inq, PA_MESSAGE_SHUTDOWN);
+
+finish:
+    pa_log_debug("audio-manager source thread shutting down");
+}
+
+static int
+suspend_stream(struct userdata *u)
+{
+    int ret;
+
+    pa_assert(u);
+
+    if (u->stream == NULL)
+        return 0;
+
+    ret = audio_manager_stream_stop(u->stream);
+    if (ret < 0) {
+        pa_log_error("failed to stop audio-manager capture stream: %d", ret);
+        return ret;
+    }
+
+    pa_log_debug("audio-manager capture stream suspended");
+    return 0;
+}
+
+static int
+resume_stream(struct userdata *u)
+{
+    int ret;
+
+    pa_assert(u);
+
+    if (u->stream == NULL) {
+        pa_rtpoll_set_timer_absolute(u->rtpoll, pa_rtclock_now());
+        return 0;
+    }
+
+    ret = audio_manager_stream_start(u->stream);
+    if (ret < 0) {
+        pa_log_error("failed to start audio-manager capture stream: %d", ret);
+        return ret;
+    }
+
+    pa_rtpoll_set_timer_absolute(u->rtpoll, pa_rtclock_now());
+    pa_log_debug("audio-manager capture stream resumed");
+    return 0;
+}
+
+static int
+source_set_state_in_io_thread_cb(pa_source *source,
+                                 pa_source_state_t new_state,
+                                 pa_suspend_cause_t new_suspend_cause)
+{
+    struct userdata *u;
+
+    pa_assert(source);
+    pa_assert_se(u = source->userdata);
+    (void)new_suspend_cause;
+
+    if (new_state == source->thread_info.state)
+        return 0;
+
+    switch (new_state) {
+    case PA_SOURCE_SUSPENDED:
+        if (PA_SOURCE_IS_OPENED(source->thread_info.state))
+            return suspend_stream(u);
+        break;
+    case PA_SOURCE_IDLE:
+    case PA_SOURCE_RUNNING:
+        if (source->thread_info.state == PA_SOURCE_SUSPENDED)
+            return resume_stream(u);
+        pa_rtpoll_set_timer_absolute(u->rtpoll, pa_rtclock_now());
+        break;
+    case PA_SOURCE_UNLINKED:
+        if (PA_SOURCE_IS_OPENED(source->thread_info.state))
+            suspend_stream(u);
+        break;
+    case PA_SOURCE_INIT:
+    case PA_SOURCE_INVALID_STATE:
+        break;
+    }
+
+    return 0;
+}
+
+static int
 set_capture_role_in_io_thread(struct userdata *u,
                               AudioManagerCaptureRole role)
 {
@@ -395,6 +438,13 @@ set_capture_role_in_io_thread(struct userdata *u,
 
     old_role = u->capture_role;
     was_opened = PA_SOURCE_IS_OPENED(u->source->thread_info.state);
+
+    if (u->stream == NULL) {
+        u->capture_role = role;
+        if (was_opened)
+            pa_rtpoll_set_timer_absolute(u->rtpoll, pa_rtclock_now());
+        return 0;
+    }
 
     if (was_opened) {
         ret = audio_manager_stream_stop(u->stream);

@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include <pulse/rtclock.h>
+#include <pulse/timeval.h>
 #include <pulse/sample.h>
 #include <pulse/util.h>
 #include <pulse/xmalloc.h>
@@ -30,6 +31,8 @@
 #include <pulsecore/rtpoll.h>
 #include <pulsecore/thread.h>
 #include <pulsecore/thread-mq.h>
+
+#define STREAM_RECOVERY_INTERVAL_USEC (PA_USEC_PER_SEC)
 
 struct userdata {
     pa_core *core;
@@ -69,7 +72,9 @@ stream_latency(struct userdata *u)
     int ret;
 
     pa_assert(u);
-    pa_assert(u->stream);
+
+    if (u->stream == NULL)
+        return 0;
 
     ret = audio_manager_stream_get_delay(u->stream, &delay_frames);
     if (ret < 0 || delay_frames < 0)
@@ -191,127 +196,6 @@ process_rewind(struct userdata *u)
 
     u->sink->thread_info.rewind_nbytes = 0;
     pa_sink_process_rewind(u->sink, 0);
-}
-
-static void
-thread_func(void *userdata)
-{
-    struct userdata *u = userdata;
-
-    pa_assert(u);
-
-    pa_log_debug("audio-manager sink thread starting");
-
-    if (u->core->realtime_scheduling)
-        pa_thread_make_realtime(u->core->realtime_priority);
-
-    pa_thread_mq_install(&u->thread_mq);
-
-    for (;;) {
-        int ret;
-
-        if (PA_SINK_IS_OPENED(u->sink->thread_info.state)) {
-            if (PA_UNLIKELY(u->sink->thread_info.rewind_requested))
-                process_rewind(u);
-
-            if (thread_write_period(u) < 0)
-                goto fail;
-
-            pa_rtpoll_set_timer_relative(u->rtpoll, 0);
-        } else
-            pa_rtpoll_set_timer_disabled(u->rtpoll);
-
-        ret = pa_rtpoll_run(u->rtpoll);
-        if (ret < 0)
-            goto fail;
-        if (ret == 0)
-            goto finish;
-    }
-
-fail:
-    pa_asyncmsgq_post(u->thread_mq.outq,
-                      PA_MSGOBJECT(u->core),
-                      PA_CORE_MESSAGE_UNLOAD_MODULE,
-                      u->module,
-                      0,
-                      NULL,
-                      NULL);
-    pa_asyncmsgq_wait_for(u->thread_mq.inq, PA_MESSAGE_SHUTDOWN);
-
-finish:
-    pa_log_debug("audio-manager sink thread shutting down");
-}
-
-static int
-suspend_stream(struct userdata *u)
-{
-    int ret;
-
-    pa_assert(u);
-
-    ret = audio_manager_stream_stop(u->stream);
-    if (ret < 0) {
-        pa_log_error("failed to stop audio-manager playback stream: %d", ret);
-        return ret;
-    }
-
-    pa_log_debug("audio-manager playback stream suspended");
-    return 0;
-}
-
-static int
-resume_stream(struct userdata *u)
-{
-    int ret;
-
-    pa_assert(u);
-
-    ret = audio_manager_stream_start(u->stream);
-    if (ret < 0) {
-        pa_log_error("failed to start audio-manager playback stream: %d", ret);
-        return ret;
-    }
-
-    pa_rtpoll_set_timer_absolute(u->rtpoll, pa_rtclock_now());
-    pa_log_debug("audio-manager playback stream resumed");
-    return 0;
-}
-
-static int
-sink_set_state_in_io_thread_cb(pa_sink *sink,
-                               pa_sink_state_t new_state,
-                               pa_suspend_cause_t new_suspend_cause)
-{
-    struct userdata *u;
-
-    pa_assert(sink);
-    pa_assert_se(u = sink->userdata);
-    (void)new_suspend_cause;
-
-    if (new_state == sink->thread_info.state)
-        return 0;
-
-    switch (new_state) {
-    case PA_SINK_SUSPENDED:
-        if (PA_SINK_IS_OPENED(sink->thread_info.state))
-            return suspend_stream(u);
-        break;
-    case PA_SINK_IDLE:
-    case PA_SINK_RUNNING:
-        if (sink->thread_info.state == PA_SINK_SUSPENDED)
-            return resume_stream(u);
-        pa_rtpoll_set_timer_absolute(u->rtpoll, pa_rtclock_now());
-        break;
-    case PA_SINK_UNLINKED:
-        if (PA_SINK_IS_OPENED(sink->thread_info.state))
-            suspend_stream(u);
-        break;
-    case PA_SINK_INIT:
-    case PA_SINK_INVALID_STATE:
-        break;
-    }
-
-    return 0;
 }
 
 static bool
@@ -448,6 +332,173 @@ restore_playback_role(struct userdata *u,
 }
 
 static int
+recover_stream(struct userdata *u)
+{
+    int ret;
+
+    pa_assert(u);
+    pa_assert(u->sink);
+
+    if (u->stream != NULL) {
+        audio_manager_stream_close(u->stream);
+        u->stream = NULL;
+    }
+
+    ret = restore_playback_role(u, u->playback_role, true);
+    if (ret < 0) {
+        pa_log_warn("failed to recover audio-manager playback stream: %d", ret);
+        return ret;
+    }
+
+    pa_log_info("recovered audio-manager playback stream");
+    return 0;
+}
+
+static void
+thread_func(void *userdata)
+{
+    struct userdata *u = userdata;
+
+    pa_assert(u);
+
+    pa_log_debug("audio-manager sink thread starting");
+
+    if (u->core->realtime_scheduling)
+        pa_thread_make_realtime(u->core->realtime_priority);
+
+    pa_thread_mq_install(&u->thread_mq);
+
+    for (;;) {
+        int ret;
+
+        if (PA_SINK_IS_OPENED(u->sink->thread_info.state)) {
+            if (u->stream == NULL) {
+                if (recover_stream(u) < 0) {
+                    pa_rtpoll_set_timer_relative(u->rtpoll, STREAM_RECOVERY_INTERVAL_USEC);
+                    goto poll;
+                }
+            }
+
+            if (PA_UNLIKELY(u->sink->thread_info.rewind_requested))
+                process_rewind(u);
+
+            if (thread_write_period(u) < 0) {
+                pa_log_warn("audio-manager playback stream failed, attempting recovery");
+                if (recover_stream(u) < 0)
+                    pa_rtpoll_set_timer_relative(u->rtpoll, STREAM_RECOVERY_INTERVAL_USEC);
+                else
+                    pa_rtpoll_set_timer_relative(u->rtpoll, 0);
+                goto poll;
+            }
+
+            pa_rtpoll_set_timer_relative(u->rtpoll, 0);
+        } else
+            pa_rtpoll_set_timer_disabled(u->rtpoll);
+
+poll:
+        ret = pa_rtpoll_run(u->rtpoll);
+        if (ret < 0)
+            goto fail;
+        if (ret == 0)
+            goto finish;
+    }
+
+fail:
+    pa_log_error("audio-manager sink rtpoll failed, unloading module");
+    pa_asyncmsgq_post(u->thread_mq.outq,
+                      PA_MSGOBJECT(u->core),
+                      PA_CORE_MESSAGE_UNLOAD_MODULE,
+                      u->module,
+                      0,
+                      NULL,
+                      NULL);
+    pa_asyncmsgq_wait_for(u->thread_mq.inq, PA_MESSAGE_SHUTDOWN);
+
+finish:
+    pa_log_debug("audio-manager sink thread shutting down");
+}
+
+static int
+suspend_stream(struct userdata *u)
+{
+    int ret;
+
+    pa_assert(u);
+
+    if (u->stream == NULL)
+        return 0;
+
+    ret = audio_manager_stream_stop(u->stream);
+    if (ret < 0) {
+        pa_log_error("failed to stop audio-manager playback stream: %d", ret);
+        return ret;
+    }
+
+    pa_log_debug("audio-manager playback stream suspended");
+    return 0;
+}
+
+static int
+resume_stream(struct userdata *u)
+{
+    int ret;
+
+    pa_assert(u);
+
+    if (u->stream == NULL) {
+        pa_rtpoll_set_timer_absolute(u->rtpoll, pa_rtclock_now());
+        return 0;
+    }
+
+    ret = audio_manager_stream_start(u->stream);
+    if (ret < 0) {
+        pa_log_error("failed to start audio-manager playback stream: %d", ret);
+        return ret;
+    }
+
+    pa_rtpoll_set_timer_absolute(u->rtpoll, pa_rtclock_now());
+    pa_log_debug("audio-manager playback stream resumed");
+    return 0;
+}
+
+static int
+sink_set_state_in_io_thread_cb(pa_sink *sink,
+                               pa_sink_state_t new_state,
+                               pa_suspend_cause_t new_suspend_cause)
+{
+    struct userdata *u;
+
+    pa_assert(sink);
+    pa_assert_se(u = sink->userdata);
+    (void)new_suspend_cause;
+
+    if (new_state == sink->thread_info.state)
+        return 0;
+
+    switch (new_state) {
+    case PA_SINK_SUSPENDED:
+        if (PA_SINK_IS_OPENED(sink->thread_info.state))
+            return suspend_stream(u);
+        break;
+    case PA_SINK_IDLE:
+    case PA_SINK_RUNNING:
+        if (sink->thread_info.state == PA_SINK_SUSPENDED)
+            return resume_stream(u);
+        pa_rtpoll_set_timer_absolute(u->rtpoll, pa_rtclock_now());
+        break;
+    case PA_SINK_UNLINKED:
+        if (PA_SINK_IS_OPENED(sink->thread_info.state))
+            suspend_stream(u);
+        break;
+    case PA_SINK_INIT:
+    case PA_SINK_INVALID_STATE:
+        break;
+    }
+
+    return 0;
+}
+
+static int
 set_playback_role_in_io_thread(struct userdata *u,
                                AudioManagerPlaybackRole role)
 {
@@ -467,6 +518,13 @@ set_playback_role_in_io_thread(struct userdata *u,
 
     old_role = u->playback_role;
     was_opened = PA_SINK_IS_OPENED(u->sink->thread_info.state);
+
+    if (u->stream == NULL) {
+        u->playback_role = role;
+        if (was_opened)
+            pa_rtpoll_set_timer_absolute(u->rtpoll, pa_rtclock_now());
+        return 0;
+    }
 
     if (was_opened) {
         ret = audio_manager_stream_stop(u->stream);
