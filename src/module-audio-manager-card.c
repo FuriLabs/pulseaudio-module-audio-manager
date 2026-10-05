@@ -1435,6 +1435,16 @@ enter_call(struct userdata *u,
         if (ret < 0)
             goto fail;
 
+        if (transport == AUDIO_MANAGER_CALL_TRANSPORT_HOSTLESS &&
+            (capabilities->flags & AUDIO_MANAGER_CAP_CALL_VOLUME) &&
+            u->sink != NULL) {
+            double volume = (double)current_sink_volume(u->sink) / PA_VOLUME_NORM;
+
+            ret = audio_manager_call_set_volume(manager, volume);
+            if (ret < 0)
+                goto fail;
+        }
+
         ret = audio_manager_call_start(manager, transport);
     }
 
