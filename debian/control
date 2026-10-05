@@ -2,6 +2,7 @@ Source: pulseaudio-module-audio-manager
 Section: sound
 Priority: optional
 Maintainer: Bardia Moshiri <bardia@furilabs.com>
+XS-FuriOS-Force-Staging: yes
 Build-Depends: debhelper-compat (= 13),
                pkg-config,
                libglib2.0-dev,
