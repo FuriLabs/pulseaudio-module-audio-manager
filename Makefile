@@ -53,7 +53,7 @@ module-audio-manager-card.so: $(CARD_OBJS) $(COMMON_LIB)
 
 install: all
 	install -d $(DESTDIR)$(MODULEDIR)
-	install -m 0755 $(COMMON_LIB) $(MODULES) $(DESTDIR)$(MODULEDIR)/
+	install -m 0644 $(COMMON_LIB) $(MODULES) $(DESTDIR)$(MODULEDIR)/
 
 clean:
 	rm -f $(COMMON_OBJS) $(SINK_OBJS) $(SOURCE_OBJS) $(CARD_OBJS) $(COMMON_LIB) $(MODULES) config.h
